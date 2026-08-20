@@ -149,7 +149,7 @@ def fetch_all_publications():
     records = []
     url = (
         f"{API_BASE}/search/resources"
-        f"?institution={USN_INSTITUTION_ID}&size={PAGE_SIZE}&sort=relevance,identifier"
+        f"?institution={USN_INSTITUTION_ID}&size={PAGE_SIZE}&sort=identifier"
     )
     page = 0
     seen_page_sizes = set()
@@ -205,13 +205,23 @@ def extract_record(raw):
     except (TypeError, ValueError):
         year = None
 
+    # NVA's "doi" field is not strictly validated on their end — real records
+    # have been seen with non-DOI URLs in it (e.g. a plain Instagram link on
+    # an "OtherPresentation" record). Trusting it blindly would inflate DOI
+    # coverage numbers and silently fail later when matching against
+    # OpenAlex. Only accept values that actually look like a DOI resolver URL.
+    raw_doi = reference.get("doi")
+    doi = raw_doi if raw_doi and raw_doi.startswith("https://doi.org/") else None
+    doi_field_present_but_invalid = bool(raw_doi) and doi is None
+
     return {
         "id": raw.get("id"),
         "identifier": raw.get("identifier"),
         "title": entity.get("mainTitle"),
         "year": year,
         "type": instance.get("type"),
-        "doi": reference.get("doi"),
+        "doi": doi,
+        "doi_field_present_but_invalid": doi_field_present_but_invalid,
         "units": sorted(units),
     }
 
@@ -232,12 +242,14 @@ def main():
     # looks structurally fine but has, say, near-zero DOI coverage or a pile
     # of untagged units is a sign something about the extraction broke.
     with_doi = sum(1 for p in publications if p["doi"])
+    with_invalid_doi_field = sum(1 for p in publications if p["doi_field_present_but_invalid"])
     with_no_unit = sum(1 for p in publications if not p["units"])
     by_type = {}
     for p in publications:
         by_type[p["type"] or "Unknown"] = by_type.get(p["type"] or "Unknown", 0) + 1
 
     print(f"DOI coverage: {with_doi}/{len(publications)} ({100*with_doi/len(publications):.1f}%)")
+    print(f"Records with a non-DOI value in the doi field (discarded, not counted as DOI coverage): {with_invalid_doi_field}")
     print(f"Records with NO recognized unit tag: {with_no_unit}")
     print("Breakdown by type:")
     for t, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
@@ -278,5 +290,11 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        print(f"FAILED: {e}", file=sys.stderr)
+        print("FAILED. Full error chain:", file=sys.stderr)
+        current = e
+        depth = 0
+        while current is not None:
+            print(f"  [{depth}] {type(current).__name__}: {current}", file=sys.stderr)
+            current = current.__cause__
+            depth += 1
         sys.exit(1)
