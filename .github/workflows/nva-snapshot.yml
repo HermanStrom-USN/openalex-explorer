@@ -1,12 +1,12 @@
 name: Refresh NVA publication snapshot
 
 # Monthly, plus a manual trigger for the first run and any ad-hoc refresh.
-# Runs server-side, which is the whole point: NVA's /search/resources
+# Runs server-side, which is the whole point - NVA's /search/resources
 # endpoint doesn't send CORS headers, so this data can't be pulled directly
 # from the browser tool the way the OpenAlex data can.
 on:
   schedule:
-    - cron: '0 3 1 * *'
+    - cron: '0 3 1 * *'   # 03:00 UTC on the 1st of every month
   workflow_dispatch: {}
 
 permissions:
@@ -31,10 +31,10 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- data/nva-publications-snapshot.json; then
-            echo "No changes to snapshot, nothing to commit."
+          git add data/nva-publications-snapshot.json
+          if git diff --cached --quiet; then
+            echo "No changes to snapshot - nothing to commit."
           else
-            git add data/nva-publications-snapshot.json
             git commit -m "Monthly NVA publication snapshot refresh"
             git push
           fi
