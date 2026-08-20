@@ -198,4 +198,136 @@ def fetch_all_publications():
             total = data.get("totalHits", "?")
             print(f"Reported totalHits: {total}. Requested page size {page_size}, got {len(hits)} on first page.")
         if page <= 5 or page % 20 == 0:
-            print(f"  ...page {page}, {len(records)} records so far. next url: {data.get('nextSearchAfterResults')
+            next_preview = data.get("nextSearchAfterResults")
+            print(f"  ...page {page}, {len(records)} records so far. next url: {next_preview}")
+        next_url = data.get("nextSearchAfterResults") or None
+        url = next_url
+        if not hits:
+            break
+    print(f"Done paginating after {page} page(s). Page sizes actually observed: {sorted(seen_page_sizes)}")
+    if degraded:
+        print("NOTE: this run had to drop to a smaller page size partway through due to a batch-size issue on NVA's end. Fetch still completed, just slower than usual.")
+    if page >= MAX_PAGES:
+        raise RuntimeError(
+            f"Hit MAX_PAGES safety cap ({MAX_PAGES}) without finishing - "
+            f"pagination may be looping. Aborting rather than risk an infinite/partial run."
+        )
+    return records
+
+
+# ---- Record extraction --------------------------------------------------------
+
+def extract_record(raw):
+    """Pull out exactly the fields the client tool needs, plus the set of
+    distinct department/faculty units this work should be counted under."""
+    entity = raw.get("entityDescription") or {}
+    reference = entity.get("reference") or {}
+    instance = reference.get("publicationInstance") or {}
+    pub_date = entity.get("publicationDate") or {}
+
+    units = set()
+    for contributor in entity.get("contributors", []):
+        for affiliation in contributor.get("affiliations", []) or []:
+            unit_id = affiliation.get("id")
+            if unit_id:
+                units.add(unit_id.rsplit("/", 1)[-1])
+
+    year = pub_date.get("year")
+    try:
+        year = int(year) if year is not None else None
+    except (TypeError, ValueError):
+        year = None
+
+    # NVA's "doi" field is not strictly validated on their end - real records
+    # have been seen with non-DOI URLs in it (e.g. a plain Instagram link on
+    # an "OtherPresentation" record). Trusting it blindly would inflate DOI
+    # coverage numbers and silently fail later when matching against
+    # OpenAlex. Only accept values that actually look like a DOI resolver URL.
+    raw_doi = reference.get("doi")
+    doi = raw_doi if raw_doi and raw_doi.startswith("https://doi.org/") else None
+    doi_field_present_but_invalid = bool(raw_doi) and doi is None
+
+    return {
+        "id": raw.get("id"),
+        "identifier": raw.get("identifier"),
+        "title": entity.get("mainTitle"),
+        "year": year,
+        "type": instance.get("type"),
+        "doi": doi,
+        "doi_field_present_but_invalid": doi_field_present_but_invalid,
+        "units": sorted(units),
+    }
+
+
+# ---- Main ------------------------------------------------------------------
+
+def main():
+    org_tree_raw = fetch_org_tree()
+    org_flat = flatten_org_tree(org_tree_raw)
+    print(f"Flattened {len(org_flat)} organizational units under USN.")
+
+    raw_records = fetch_all_publications()
+    print(f"Fetched {len(raw_records)} raw publication records.")
+
+    publications = [extract_record(r) for r in raw_records]
+
+    # Sanity checks - surfaced loudly, not silently absorbed. A snapshot that
+    # looks structurally fine but has, say, near-zero DOI coverage or a pile
+    # of untagged units is a sign something about the extraction broke.
+    with_doi = sum(1 for p in publications if p["doi"])
+    with_invalid_doi_field = sum(1 for p in publications if p["doi_field_present_but_invalid"])
+    with_no_unit = sum(1 for p in publications if not p["units"])
+    by_type = {}
+    for p in publications:
+        by_type[p["type"] or "Unknown"] = by_type.get(p["type"] or "Unknown", 0) + 1
+
+    print(f"DOI coverage: {with_doi}/{len(publications)} ({100*with_doi/len(publications):.1f}%)")
+    print(f"Records with a non-DOI value in the doi field (discarded, not counted as DOI coverage): {with_invalid_doi_field}")
+    print(f"Records with NO recognized unit tag: {with_no_unit}")
+    print("Breakdown by type:")
+    for t, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
+        print(f"  {t}: {n}")
+
+    if len(publications) == 0:
+        raise RuntimeError("Fetched zero publications - refusing to write an empty snapshot over a good one.")
+    if with_no_unit > len(publications) * 0.5:
+        raise RuntimeError(
+            f"Over half of records ({with_no_unit}/{len(publications)}) have no recognized unit tag - "
+            f"this smells like a schema change upstream, not normal data. Aborting rather than "
+            f"shipping a snapshot that can't actually be browsed by department."
+        )
+
+    # Precompute unit -> [publication index] for fast client-side lookup,
+    # so the browser tool doesn't have to scan every publication per view.
+    by_unit = {}
+    for idx, p in enumerate(publications):
+        for unit in p["units"]:
+            by_unit.setdefault(unit, []).append(idx)
+
+    snapshot = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": "NVA (api.nva.unit.no/search/resources), institution=222",
+        "institution_total_publications": len(publications),
+        "doi_coverage": {"with_doi": with_doi, "total": len(publications)},
+        "organizations": org_flat,
+        "publications": publications,
+        "by_unit": by_unit,
+    }
+
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    OUTPUT_PATH.write_text(json.dumps(snapshot, ensure_ascii=False, indent=None, separators=(",", ":")))
+    print(f"Wrote {OUTPUT_PATH} ({OUTPUT_PATH.stat().st_size / 1024 / 1024:.2f} MB)")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print("FAILED. Full error chain:", file=sys.stderr)
+        current = e
+        depth = 0
+        while current is not None:
+            print(f"  [{depth}] {type(current).__name__}: {current}", file=sys.stderr)
+            current = current.__cause__
+            depth += 1
+        sys.exit(1)
