@@ -101,6 +101,7 @@ Design notes, so future edits don't have to re-derive these from scratch:
 
 import json
 import math
+import re
 import sys
 import time
 import urllib.error
@@ -263,6 +264,17 @@ YEAR_MIN = 1970  # generous lower bound — years with zero results cost one fas
                   # request each, so an overly wide range is cheap; too narrow would
                   # silently drop real data. Widen if the cross-check below flags a gap.
 
+# If a page fails even after fetch_json's own retries at the normal PAGE_SIZE, these are
+# tried in order, from the exact same search_after position, before giving up on that
+# position entirely. Confirmed against a real reproducible case (years 1970-2024 fetched
+# cleanly at size=100; year 2025 failed identically 4 times at size=100 on its second
+# page) — the theory is that NVA's 500 is tied to processing/serializing a full batch
+# together (a resource or timeout limit, possibly compounded by one problematic record's
+# effect across the batch) rather than one permanently unfetchable record, so a much
+# smaller batch from the same position may simply succeed. Smallest-last so the common
+# case (PAGE_SIZE just works) pays no extra cost.
+FALLBACK_PAGE_SIZES = (20, 5, 1)
+
 
 def fetch_true_total_count():
     """A single lightweight call (size=1, never paginated) purely to read NVA's own
@@ -278,12 +290,23 @@ def fetch_true_total_count():
 
 def fetch_publications_for_year(year):
     """Paginate through USN publications for a single year, using the same search_after +
-    sort=identifier mechanism as before, just scoped to one year at a time. This exists
-    because a whole-corpus search_after chain hit a persistent, reproducible 500 from
-    NVA's own server partway through (four identical failures on retry, not our request's
-    fault) — slicing by year keeps each chain far shorter, which may avoid whatever
-    specific record triggers it, and if a year DOES still fail, says exactly which one
-    rather than losing everything past an arbitrary page boundary in one giant chain."""
+    sort=identifier mechanism as before, just scoped to one year at a time.
+
+    If a page fails even after fetch_json's own retries, progressively smaller page sizes
+    (FALLBACK_PAGE_SIZES) are tried from the exact same position before giving up — see
+    that constant's comment for why this is a reasonable thing to try, not a wild guess.
+
+    If even size=1 still fails at some position, this year's fetch STOPS there rather than
+    raising and losing every record already fetched for the year: whatever was gathered
+    before the block is kept, and the blocking point is returned (as a URL, for
+    diagnostics) so the caller can record the gap explicitly rather than the snapshot
+    silently being short. This is a deliberate, narrow exception to this script's normal
+    "no partial data, ever" principle (see module docstring) — justified specifically
+    because it only engages after exhausting every other option (fetch_json's own retries,
+    then three smaller batch sizes down to a single record), and because the gap is
+    recorded in the output, not hidden.
+
+    Returns (records, blocked_at_url_or_None)."""
     records = []
     url = (
         f"{API_BASE}/search/resources"
@@ -291,9 +314,30 @@ def fetch_publications_for_year(year):
         f"&size={PAGE_SIZE}&sort=identifier"
     )
     page = 0
+    blocked_at = None
     while url and page < MAX_PAGES:
         page += 1
-        data = fetch_json(url)
+        try:
+            data = fetch_json(url)
+        except Exception:
+            data = None
+            for fallback_size in FALLBACK_PAGE_SIZES:
+                fallback_url = re.sub(r"size=\d+", f"size={fallback_size}", url)
+                print(f"    [year {year}] page failed at the default size; retrying at size={fallback_size}...", file=sys.stderr)
+                try:
+                    data = fetch_json(fallback_url)
+                    print(f"    [year {year}] size={fallback_size} succeeded.", file=sys.stderr)
+                    break
+                except Exception:
+                    continue
+            if data is None:
+                blocked_at = url
+                print(
+                    f"    [year {year}] even size=1 failed at this position — stopping this "
+                    f"year's fetch here, keeping {len(records)} record(s) already fetched for {year}.",
+                    file=sys.stderr,
+                )
+                break
         hits = data.get("hits", [])
         records.extend(hits)
         url = data.get("nextSearchAfterResults") or None
@@ -304,42 +348,51 @@ def fetch_publications_for_year(year):
             f"Hit MAX_PAGES safety cap ({MAX_PAGES}) for year {year} — "
             f"pagination may be looping. Aborting rather than risk an infinite/partial run."
         )
-    return records
+    return records, blocked_at
 
 
 def fetch_all_publications():
     """One query per year (YEAR_MIN..current+1) instead of one continuous whole-corpus
-    search_after chain — see fetch_publications_for_year's docstring for why. A failure in
-    any single year still aborts the whole run immediately (same "no partial snapshot"
-    principle as before — see module docstring), but the error will now name the specific
-    year in progress, which is real diagnostic information a whole-corpus chain couldn't
-    give us: if only one year is ever the problem, that's a very different, much smaller
-    thing to investigate than "pagination breaks somewhere past record 2000"."""
+    search_after chain — see fetch_publications_for_year's docstring for why. Returns
+    (records, gaps) — gaps is a list of {"year", "blocked_at_url", "records_fetched"}
+    entries for any year where pagination had to stop early even after the fallback-size
+    retries in fetch_publications_for_year, so main() can record them explicitly in the
+    snapshot rather than the gap being invisible."""
     true_total = fetch_true_total_count()
     print(f"NVA's own reported total for institution={USN_INSTITUTION_ID}: {true_total}")
 
     all_records = []
+    gaps = []
     current_year = datetime.now(timezone.utc).year
     for year in range(YEAR_MIN, current_year + 2):
-        year_records = fetch_publications_for_year(year)
+        year_records, blocked_at = fetch_publications_for_year(year)
         if year_records:
             print(f"  Year {year}: {len(year_records)} records (running total: {len(all_records) + len(year_records)})")
+        if blocked_at:
+            gaps.append({"year": year, "blocked_at_url": blocked_at, "records_fetched": len(year_records)})
         all_records.extend(year_records)
 
     print(f"Done: {len(all_records)} records fetched across years {YEAR_MIN}-{current_year + 1}.")
-    if isinstance(true_total, int) and len(all_records) != true_total:
-        # Loud, not fatal — a mismatch here is exactly the kind of thing that should show
-        # up as a visible number in the log, not get silently absorbed. It doesn't
-        # necessarily mean data is missing (see the printed detail below for why), but it
-        # needs a human to look at it before trusting the snapshot.
+    if gaps:
         print(
-            f"WARNING: fetched {len(all_records)} records but NVA reported {true_total} total. "
-            f"Could mean YEAR_MIN={YEAR_MIN} is too narrow (widen it), or that some records have "
-            f"no publication year and fall outside every year-sliced query, or a genuine "
-            f"discrepancy worth investigating before trusting this snapshot.",
+            f"WARNING: {len(gaps)} year(s) hit a persistent server error partway through, even "
+            f"at the smallest fallback size — pagination stopped early for: "
+            f"{[g['year'] for g in gaps]}. Records fetched before each block are kept; see "
+            f"'pagination_gaps' in the output snapshot for exact detail.",
             file=sys.stderr,
         )
-    return all_records
+    if isinstance(true_total, int) and len(all_records) != true_total and not gaps:
+        # Only surfaced when there's no other explanation already logged above — if gaps
+        # exist, the shortfall is already accounted for and repeating the warning would
+        # just be noise on top of a more specific one.
+        print(
+            f"WARNING: fetched {len(all_records)} records but NVA reported {true_total} total, "
+            f"with no pagination gaps recorded. Could mean YEAR_MIN={YEAR_MIN} is too narrow "
+            f"(widen it), or that some records have no publication year and fall outside every "
+            f"year-sliced query — worth investigating before trusting this snapshot.",
+            file=sys.stderr,
+        )
+    return all_records, gaps
 
 
 # ---- Record extraction --------------------------------------------------------
@@ -462,7 +515,7 @@ def main():
     org_flat = flatten_org_tree(org_tree_raw)
     print(f"Flattened {len(org_flat)} organizational units under USN.")
 
-    raw_records = fetch_all_publications()
+    raw_records, pagination_gaps = fetch_all_publications()
     print(f"Fetched {len(raw_records)} raw publication records.")
 
     publications = [extract_record(r) for r in raw_records]
@@ -537,7 +590,20 @@ def main():
         "partner_organizations": partner_orgs_resolved,
         "publications": publications,
         "by_unit": by_unit,
+        # Any year(s) where a persistent NVA-side server error blocked pagination even at
+        # the smallest fallback size (see fetch_publications_for_year) — empty in the
+        # normal case. Present explicitly, not just as a log line, so the gap is visible
+        # to anyone reading the snapshot itself, not only whoever happened to read this
+        # run's Action log.
+        "pagination_gaps": pagination_gaps,
     }
+
+    if pagination_gaps:
+        print(
+            f"NOTE: this snapshot has {len(pagination_gaps)} known pagination gap(s) "
+            f"(see 'pagination_gaps' in the output) — years affected: "
+            f"{[g['year'] for g in pagination_gaps]}.",
+        )
 
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT_PATH.write_text(json.dumps(snapshot, ensure_ascii=False, indent=None, separators=(",", ":")))
