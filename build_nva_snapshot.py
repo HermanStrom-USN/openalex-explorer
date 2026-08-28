@@ -165,12 +165,23 @@ def fetch_json(url):
                 return json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as e:
             last_error = e
+            # Read the response body before it's discarded — REST APIs commonly return a
+            # JSON body on 4xx/5xx explaining exactly what was wrong with the request, and
+            # a bare status line ("HTTP Error 400: Bad Request") throws that away. This is
+            # what turns an unactionable mystery failure into one that says what's wrong.
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = "(could not read response body)"
             if e.code == 429 or e.code >= 500:
                 wait = RETRY_BACKOFF_SECONDS * attempt
                 print(f"  [retry {attempt}/{RETRY_ATTEMPTS}] HTTP {e.code} on {url} — waiting {wait}s", file=sys.stderr)
+                print(f"    Response body: {body[:500]}", file=sys.stderr)
                 time.sleep(wait)
                 continue
-            raise  # 4xx other than 429 is not going to fix itself on retry
+            # 4xx other than 429 is not going to fix itself on retry — but include the body
+            # so whoever reads this knows *why*, not just *that* it failed.
+            raise RuntimeError(f"HTTP {e.code} on {url}\nResponse body: {body[:2000]}") from e
         except (urllib.error.URLError, TimeoutError) as e:
             last_error = e
             wait = RETRY_BACKOFF_SECONDS * attempt
@@ -270,6 +281,12 @@ def fetch_all_publications():
         if page == 1:
             total = data.get("totalHits", "?")
             print(f"Reported totalHits: {total}. Requested page size {PAGE_SIZE}, got {len(hits)} on first page.")
+            # Printed unconditionally (not just on failure) so the very next run — whether it
+            # succeeds or fails again — shows us exactly what NVA's response actually looks
+            # like, rather than relying on the "nextSearchAfterResults is a ready-to-use full
+            # URL" assumption this loop was written against without being able to see it fail.
+            print(f"Top-level response keys: {sorted(data.keys())}")
+            print(f"nextSearchAfterResults value: {data.get('nextSearchAfterResults')!r}")
         if page % 20 == 0:
             print(f"  ...page {page}, {len(records)} records so far")
         url = data.get("nextSearchAfterResults") or None
