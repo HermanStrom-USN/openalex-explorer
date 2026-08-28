@@ -234,13 +234,26 @@ def resolve_partner_organizations(root_codes):
     encountered anywhere in the dataset. One fetch per institution (root_codes
     are already institution-level, not per-department), so this stays cheap
     even across USN's full publication history — the number of DISTINCT
-    collaborating institutions is nowhere near USN's own record count."""
+    collaborating institutions is nowhere near USN's own record count.
+
+    A first real run resolved 3,014 partner institutions but the
+    international-collaboration flag came back 0/57,860 — implausible for a
+    research university, meaning countryCode isn't actually the field this
+    endpoint returns country under. Rather than guess a second time, this
+    prints the real raw shape of the first successfully resolved org, once,
+    so the next run shows us the truth directly."""
     resolved = {}
     codes = sorted(c for c in root_codes if c)
     print(f"Resolving {len(codes)} distinct partner institution(s)...")
+    diagnostic_printed = False
     for i, code in enumerate(codes, 1):
         try:
             data = fetch_json(f"{API_BASE}/cristin/organization/{code}")
+            if not diagnostic_printed:
+                diagnostic_printed = True
+                print(f"DIAGNOSTIC: raw response shape for first partner org ({code}):", file=sys.stderr)
+                print(f"  Top-level keys: {sorted(data.keys())}", file=sys.stderr)
+                print(f"  Full response (truncated to 1500 chars): {json.dumps(data, indent=2, ensure_ascii=False)[:1500]}", file=sys.stderr)
             labels = data.get("labels", {}) or {}
             resolved[code] = {
                 "label_en": labels.get("en") or labels.get("nb") or code,
@@ -410,11 +423,26 @@ def extract_channel_level(reference):
     return level if level in ("LevelOne", "LevelTwo") else None
 
 
+_diagnostic_state = {"artifact_printed": False}
+
+
 def has_open_file(raw):
     """No dedicated OA field in NVA's schema — inferred from whether at least
     one associated artifact is a publicly visible file with a license
-    attached. A heuristic, not an authoritative OA status."""
-    for artifact in raw.get("associatedArtifacts", []) or []:
+    attached. A heuristic, not an authoritative OA status.
+
+    A first real run against USN's full data returned 0.0% open access across
+    57,860 records — implausible for a university this size, meaning the
+    field names/values checked below (based on one documentation example)
+    don't match what NVA actually returns. Rather than guess a second time,
+    this prints the real raw shape of the first record that has ANY
+    associatedArtifacts, once, so the next run shows us the truth directly."""
+    artifacts = raw.get("associatedArtifacts", []) or []
+    if artifacts and not _diagnostic_state["artifact_printed"]:
+        _diagnostic_state["artifact_printed"] = True
+        print(f"DIAGNOSTIC: first record with any associatedArtifacts (id={raw.get('id')}):", file=sys.stderr)
+        print(f"  {json.dumps(artifacts, indent=2, ensure_ascii=False)[:2000]}", file=sys.stderr)
+    for artifact in artifacts:
         if (
             artifact.get("type") == "PublishedFile"
             and artifact.get("visibleForNonOwner")
