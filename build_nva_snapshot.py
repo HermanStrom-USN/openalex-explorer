@@ -268,7 +268,15 @@ def fetch_all_publications():
     records = []
     url = (
         f"{API_BASE}/search/resources"
-        f"?institution={USN_INSTITUTION_ID}&size={PAGE_SIZE}&sort=relevance,identifier"
+        # sort=relevance,identifier (the original value) fails outright once pagination
+        # kicks in — NVA rejects relevance sorting combined with search_after cursors
+        # ("Sorted by relevance & searchAfter are mutual exclusive", confirmed against a
+        # real 400 response). That tracks: there's no free-text query here, so relevance
+        # scoring has nothing to rank against and is presumably a constant/meaningless
+        # score per record — exactly the kind of non-unique sort search_after can't
+        # paginate against reliably. Sorting by identifier alone (a genuinely unique field)
+        # is the correct fix, not just a workaround for the error.
+        f"?institution={USN_INSTITUTION_ID}&size={PAGE_SIZE}&sort=identifier"
     )
     page = 0
     seen_page_sizes = set()
