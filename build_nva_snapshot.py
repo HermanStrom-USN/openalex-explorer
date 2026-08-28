@@ -259,54 +259,87 @@ def resolve_partner_organizations(root_codes):
 
 # ---- Publication pull --------------------------------------------------------
 
-def fetch_all_publications():
-    """Paginate through every USN publication using the search_after cursor
-    (not plain from/size — Elasticsearch-backed search APIs like this one
-    typically stop honoring deep offsets well before USN's ~58k-record total,
-    which is exactly why NVA's own response includes a dedicated
-    nextSearchAfterResults cursor URL)."""
+YEAR_MIN = 1970  # generous lower bound — years with zero results cost one fast, empty
+                  # request each, so an overly wide range is cheap; too narrow would
+                  # silently drop real data. Widen if the cross-check below flags a gap.
+
+
+def fetch_true_total_count():
+    """A single lightweight call (size=1, never paginated) purely to read NVA's own
+    authoritative totalHits for institution=222 — this exact call already worked cleanly
+    (it's how "Reported totalHits: 57869" showed up before deeper pagination hit trouble),
+    so it's safe to keep using as a cross-check reference: after slicing the real pull by
+    year below, comparing the summed count against this number is what would catch a year
+    range that's too narrow, rather than silently shipping an incomplete snapshot."""
+    url = f"{API_BASE}/search/resources?institution={USN_INSTITUTION_ID}&size=1&sort=identifier"
+    data = fetch_json(url)
+    return data.get("totalHits")
+
+
+def fetch_publications_for_year(year):
+    """Paginate through USN publications for a single year, using the same search_after +
+    sort=identifier mechanism as before, just scoped to one year at a time. This exists
+    because a whole-corpus search_after chain hit a persistent, reproducible 500 from
+    NVA's own server partway through (four identical failures on retry, not our request's
+    fault) — slicing by year keeps each chain far shorter, which may avoid whatever
+    specific record triggers it, and if a year DOES still fail, says exactly which one
+    rather than losing everything past an arbitrary page boundary in one giant chain."""
     records = []
     url = (
         f"{API_BASE}/search/resources"
-        # sort=relevance,identifier (the original value) fails outright once pagination
-        # kicks in — NVA rejects relevance sorting combined with search_after cursors
-        # ("Sorted by relevance & searchAfter are mutual exclusive", confirmed against a
-        # real 400 response). That tracks: there's no free-text query here, so relevance
-        # scoring has nothing to rank against and is presumably a constant/meaningless
-        # score per record — exactly the kind of non-unique sort search_after can't
-        # paginate against reliably. Sorting by identifier alone (a genuinely unique field)
-        # is the correct fix, not just a workaround for the error.
-        f"?institution={USN_INSTITUTION_ID}&size={PAGE_SIZE}&sort=identifier"
+        f"?institution={USN_INSTITUTION_ID}&publicationYear={year}-{year}"
+        f"&size={PAGE_SIZE}&sort=identifier"
     )
     page = 0
-    seen_page_sizes = set()
     while url and page < MAX_PAGES:
         page += 1
         data = fetch_json(url)
         hits = data.get("hits", [])
-        seen_page_sizes.add(len(hits))
         records.extend(hits)
-        if page == 1:
-            total = data.get("totalHits", "?")
-            print(f"Reported totalHits: {total}. Requested page size {PAGE_SIZE}, got {len(hits)} on first page.")
-            # Printed unconditionally (not just on failure) so the very next run — whether it
-            # succeeds or fails again — shows us exactly what NVA's response actually looks
-            # like, rather than relying on the "nextSearchAfterResults is a ready-to-use full
-            # URL" assumption this loop was written against without being able to see it fail.
-            print(f"Top-level response keys: {sorted(data.keys())}")
-            print(f"nextSearchAfterResults value: {data.get('nextSearchAfterResults')!r}")
-        if page % 20 == 0:
-            print(f"  ...page {page}, {len(records)} records so far")
         url = data.get("nextSearchAfterResults") or None
         if not hits:
             break
-    print(f"Done paginating after {page} page(s). Page sizes actually observed: {sorted(seen_page_sizes)}")
     if page >= MAX_PAGES:
         raise RuntimeError(
-            f"Hit MAX_PAGES safety cap ({MAX_PAGES}) without finishing — "
+            f"Hit MAX_PAGES safety cap ({MAX_PAGES}) for year {year} — "
             f"pagination may be looping. Aborting rather than risk an infinite/partial run."
         )
     return records
+
+
+def fetch_all_publications():
+    """One query per year (YEAR_MIN..current+1) instead of one continuous whole-corpus
+    search_after chain — see fetch_publications_for_year's docstring for why. A failure in
+    any single year still aborts the whole run immediately (same "no partial snapshot"
+    principle as before — see module docstring), but the error will now name the specific
+    year in progress, which is real diagnostic information a whole-corpus chain couldn't
+    give us: if only one year is ever the problem, that's a very different, much smaller
+    thing to investigate than "pagination breaks somewhere past record 2000"."""
+    true_total = fetch_true_total_count()
+    print(f"NVA's own reported total for institution={USN_INSTITUTION_ID}: {true_total}")
+
+    all_records = []
+    current_year = datetime.now(timezone.utc).year
+    for year in range(YEAR_MIN, current_year + 2):
+        year_records = fetch_publications_for_year(year)
+        if year_records:
+            print(f"  Year {year}: {len(year_records)} records (running total: {len(all_records) + len(year_records)})")
+        all_records.extend(year_records)
+
+    print(f"Done: {len(all_records)} records fetched across years {YEAR_MIN}-{current_year + 1}.")
+    if isinstance(true_total, int) and len(all_records) != true_total:
+        # Loud, not fatal — a mismatch here is exactly the kind of thing that should show
+        # up as a visible number in the log, not get silently absorbed. It doesn't
+        # necessarily mean data is missing (see the printed detail below for why), but it
+        # needs a human to look at it before trusting the snapshot.
+        print(
+            f"WARNING: fetched {len(all_records)} records but NVA reported {true_total} total. "
+            f"Could mean YEAR_MIN={YEAR_MIN} is too narrow (widen it), or that some records have "
+            f"no publication year and fall outside every year-sliced query, or a genuine "
+            f"discrepancy worth investigating before trusting this snapshot.",
+            file=sys.stderr,
+        )
+    return all_records
 
 
 # ---- Record extraction --------------------------------------------------------
