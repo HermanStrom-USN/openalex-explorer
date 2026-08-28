@@ -287,7 +287,7 @@ def fetch_publications_for_year(year):
     records = []
     url = (
         f"{API_BASE}/search/resources"
-        f"?institution={USN_INSTITUTION_ID}&publicationYear={year}-{year}"
+        f"?institution={USN_INSTITUTION_ID}&publicationYear={year}"
         f"&size={PAGE_SIZE}&sort=identifier"
     )
     page = 0
