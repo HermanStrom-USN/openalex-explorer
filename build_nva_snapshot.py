@@ -258,7 +258,10 @@ def resolve_partner_organizations(root_codes):
             resolved[code] = {
                 "label_en": labels.get("en") or labels.get("nb") or code,
                 "label_nb": labels.get("nb", ""),
-                "country_code": data.get("countryCode"),
+                # Confirmed via a real diagnostic print: the field is "country", not
+                # "countryCode" — the wrong guess silently left every partner org's
+                # country as None, which meant nothing ever counted as international.
+                "country_code": data.get("country"),
             }
         except Exception as e:
             # A single partner org failing to resolve is a cosmetic gap (it'll show as a
@@ -428,26 +431,31 @@ _diagnostic_state = {"artifact_printed": False}
 
 def has_open_file(raw):
     """No dedicated OA field in NVA's schema — inferred from whether at least
-    one associated artifact is a publicly visible file with a license
-    attached. A heuristic, not an authoritative OA status.
+    one associated artifact is a publicly downloadable file.
 
-    A first real run against USN's full data returned 0.0% open access across
-    57,860 records — implausible for a university this size, meaning the
-    field names/values checked below (based on one documentation example)
-    don't match what NVA actually returns. Rather than guess a second time,
-    this prints the real raw shape of the first record that has ANY
-    associatedArtifacts, once, so the next run shows us the truth directly."""
+    Confirmed against a real record (a first run returned an implausible 0.0%
+    across 57,860 records, then a one-time diagnostic print showed the actual
+    shape): the artifact type is "OpenFile", not "PublishedFile" as the one
+    documentation example this was originally built from suggested, and there
+    is no "visibleForNonOwner" field at all — both were silently excluding
+    every single record.
+
+    Deliberately does NOT also require a specific license: the same real
+    example had an OpenFile whose license was "COPYRIGHT-ACT" ("General
+    Terms of Use") — restrictive, not an open license — while still being a
+    freely downloadable PDF. NVA's OpenFile type is tracking *accessibility*
+    (can someone read this for free), not *reuse rights* (can they adapt or
+    redistribute it) — that's the right thing for this flag to mean, matching
+    the common "green OA" sense most institutional reporting cares about, but
+    it is NOT the same claim as "openly licensed for reuse", and should be
+    labeled that way wherever it's surfaced in the client tool."""
     artifacts = raw.get("associatedArtifacts", []) or []
     if artifacts and not _diagnostic_state["artifact_printed"]:
         _diagnostic_state["artifact_printed"] = True
         print(f"DIAGNOSTIC: first record with any associatedArtifacts (id={raw.get('id')}):", file=sys.stderr)
         print(f"  {json.dumps(artifacts, indent=2, ensure_ascii=False)[:2000]}", file=sys.stderr)
     for artifact in artifacts:
-        if (
-            artifact.get("type") == "PublishedFile"
-            and artifact.get("visibleForNonOwner")
-            and artifact.get("license")
-        ):
+        if artifact.get("type") == "OpenFile":
             return True
     return False
 
