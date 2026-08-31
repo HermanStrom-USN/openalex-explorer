@@ -1,0 +1,49 @@
+name: Refresh NVA publication snapshot (USN)
+
+# Monthly, plus a manual trigger for the first run and any ad-hoc refresh.
+# Runs server-side, which is the whole point — NVA's /search/resources
+# endpoint doesn't send CORS headers, so this data can't be pulled directly
+# from the browser tool the way the OpenAlex data can.
+#
+# USN-only, kept as its own dedicated workflow rather than folded into the
+# multi-institution matrix (nva-snapshot-multi.yml) — USN's own monthly
+# refresh shouldn't be coupled to or blocked by the other nine universities'
+# runs. build_nva_snapshot.py defaults to USN (institution 222) when
+# NVA_INSTITUTION_ID isn't set, which is why no env var is passed here; the
+# output file is data/nva-snapshot-222.json, not the old
+# data/nva-publications-snapshot.json name — that changed when the script
+# was generalized to build any institution's snapshot, not just USN's.
+on:
+  schedule:
+    - cron: '0 3 1 * *'   # 03:00 UTC on the 1st of every month
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  refresh-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Build snapshot
+        run: python build_nva_snapshot.py
+
+      - name: Commit and push if the snapshot changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- data/nva-snapshot-222.json; then
+            echo "No changes to snapshot — nothing to commit."
+          else
+            git add data/nva-snapshot-222.json
+            git commit -m "Monthly NVA publication snapshot refresh (USN)"
+            git push
+          fi
