@@ -413,17 +413,57 @@ def fetch_all_publications():
 
 # ---- Record extraction --------------------------------------------------------
 
-def extract_channel_level(reference):
-    """Returns the channel's NVI level ('LevelOne'/'LevelTwo') or None. Checked
-    in three places since which one is populated depends on the context type —
-    see module docstring."""
+def extract_channel_ref_and_level(reference):
+    """Returns (channel_ref_url, direct_level).
+
+    Confirmed via a live diagnostic against 5 real USN journal articles (see
+    conversation): for Journal-type contexts, publicationContext is ONLY {id, type} — a
+    REFERENCE to a separate, year-versioned channel resource
+    (publication-channels-v2/serial-publication/{uuid}/{year}) where scientificValue
+    actually lives. The publication record itself never carries the level directly for
+    this case. This matters a lot: Journal-type contexts cover journal articles, the
+    single largest NVI-eligible category, so this reference has to be resolved (see
+    resolve_channel_levels() and main()) for level/points to be meaningfully correct —
+    checking only the publication record, as an earlier version of this script did,
+    silently missed the level for nearly all journal articles.
+
+    For Report/Publisher-type contexts, scientificValue CAN appear directly embedded on
+    context.publisher (confirmed against NVA's own documented example) — that's returned
+    directly here as a shortcut, so those records don't need a resolution fetch at all.
+    Both checks run every time since context type isn't itself a reliable signal for
+    which shape applies."""
     context = reference.get("publicationContext") or {}
-    level = context.get("scientificValue")
-    if not level:
-        level = (context.get("publisher") or {}).get("scientificValue")
-    if not level:
-        level = (context.get("series") or {}).get("scientificValue")
-    return level if level in ("LevelOne", "LevelTwo") else None
+    direct_level = context.get("scientificValue")
+    if not direct_level:
+        direct_level = (context.get("publisher") or {}).get("scientificValue")
+    if not direct_level:
+        direct_level = (context.get("series") or {}).get("scientificValue")
+    if direct_level not in ("LevelOne", "LevelTwo"):
+        direct_level = None
+    channel_ref = context.get("id")
+    return channel_ref, direct_level
+
+
+def resolve_channel_levels(channel_refs):
+    """Resolves scientificValue for each distinct referenced channel resource — one
+    fetch per distinct (channel, year) combination, which is far fewer than one per
+    publication, since many articles share the same journal in the same year. A single
+    channel failing to resolve is a cosmetic/coverage gap for publications using it, not
+    a structural problem — logged, not fatal, same reasoning as partner org resolution."""
+    resolved = {}
+    refs = sorted(r for r in channel_refs if r)
+    print(f"Resolving {len(refs)} distinct channel-year reference(s) for journal-type levels...")
+    for i, ref in enumerate(refs, 1):
+        try:
+            data = fetch_json(ref)
+            level = data.get("scientificValue")
+            resolved[ref] = level if level in ("LevelOne", "LevelTwo") else None
+        except Exception as e:
+            print(f"  [warn] Could not resolve channel {ref}: {e} — level will stay unknown for publications using it.", file=sys.stderr)
+            resolved[ref] = None
+        if i % 100 == 0:
+            print(f"  ...resolved {i}/{len(refs)}")
+    return resolved
 
 
 _diagnostic_state = {"artifact_printed": False}
@@ -497,12 +537,33 @@ def compute_base_nvi_points(category, level, n, total_pairs):
     return weight * share, form
 
 
+def extract_person_id(identity_id):
+    """Cristin person URIs end in a numeric ID (e.g. .../cristin/person/11111) — pulls
+    just that trailing ID, the same trailing-segment convention already used for
+    organization codes throughout this script."""
+    if not identity_id:
+        return None
+    code = identity_id.rsplit("/", 1)[-1]
+    return code or None
+
+
 def extract_record(raw):
     """Pull out exactly the fields the client tool needs, plus the set of
     distinct department/faculty units this work should be counted under,
     channel level, a provisional NVI point value (international multiplier
-    applied afterward in main(), once partner countries are resolved), and
-    an inferred open-access flag."""
+    applied afterward in main(), once partner countries are resolved), an
+    inferred open-access flag, and the USN-affiliated contributors on this
+    work (for the "virtual research group" feature — see conversation).
+
+    Returns (record, person_names): person_names is a small {person_id: name}
+    dict for just this record's USN-affiliated contributors, merged into a
+    single snapshot-wide `authors` dict in main() rather than repeating names
+    on every publication — the same reference-by-code pattern already used
+    for units/organizations and partner_orgs/partner_organizations. Only
+    USN-affiliated contributors are tracked at all: external co-authors'
+    names aren't needed for a USN research-group feature, and leaving them
+    out keeps both the snapshot smaller and the eventual author search
+    scoped to people actually worth building a USN group around."""
     entity = raw.get("entityDescription") or {}
     reference = entity.get("reference") or {}
     instance = reference.get("publicationInstance") or {}
@@ -510,11 +571,23 @@ def extract_record(raw):
     contributors = entity.get("contributors", [])
 
     units = set()
+    author_ids = set()
+    person_names = {}
     for contributor in contributors:
+        identity = contributor.get("identity") or {}
+        person_id = extract_person_id(identity.get("id"))
+        contributor_units = set()
         for affiliation in contributor.get("affiliations", []) or []:
             unit_id = affiliation.get("id")
             if unit_id:
-                units.add(unit_id.rsplit("/", 1)[-1])
+                unit_code = unit_id.rsplit("/", 1)[-1]
+                units.add(unit_code)
+                contributor_units.add(unit_code)
+        is_usn_contributor = any(institution_root(u) == USN_ORG_ROOT for u in contributor_units)
+        if person_id and is_usn_contributor:
+            author_ids.add(person_id)
+            if identity.get("name"):
+                person_names[person_id] = identity["name"]
 
     year = pub_date.get("year")
     try:
@@ -523,11 +596,10 @@ def extract_record(raw):
         year = None
 
     category = instance.get("type")
-    level = extract_channel_level(reference)
+    channel_ref, direct_level = extract_channel_ref_and_level(reference)
     total_pairs, usn_pairs, partner_roots = compute_author_shares(contributors)
-    base_points, form = compute_base_nvi_points(category, level, usn_pairs, total_pairs)
 
-    return {
+    record = {
         "id": raw.get("id"),
         "identifier": raw.get("identifier"),
         "title": entity.get("mainTitle"),
@@ -535,13 +607,18 @@ def extract_record(raw):
         "type": category,
         "doi": reference.get("doi"),
         "units": sorted(units),
-        "level": level,
-        "nvi_form": form,
-        "points": base_points,           # finalized (international x1.3) in main()
-        "international": False,          # finalized in main(), once partner countries are known
+        "level": direct_level,            # finalized in main() once channel_ref (if any) is resolved
+        "nvi_form": NVI_FORM_BY_CATEGORY.get(category),
+        "points": 0.0,                    # finalized in main() — needs level to be final first
+        "international": False,           # finalized in main(), once partner countries are known
         "partner_orgs": sorted(partner_roots),
         "open_access": has_open_file(raw),
+        "author_ids": sorted(author_ids),
+        "_channel_ref": channel_ref,      # internal only — resolved and stripped in main(), never written to the output file
+        "_usn_pairs": usn_pairs,          # internal only — needed to compute points once level is final
+        "_total_pairs": total_pairs,      # internal only — needed to compute points once level is final
     }
+    return record, person_names
 
 
 # ---- Main ------------------------------------------------------------------
@@ -554,7 +631,27 @@ def main():
     raw_records, pagination_gaps = fetch_all_publications()
     print(f"Fetched {len(raw_records)} raw publication records.")
 
-    publications = [extract_record(r) for r in raw_records]
+    publications = []
+    all_person_names = {}
+    for r in raw_records:
+        record, person_names = extract_record(r)
+        publications.append(record)
+        all_person_names.update(person_names)
+
+    # ---- Resolve journal-type channel levels (see extract_channel_ref_and_level's
+    # docstring — confirmed via live diagnostic that Journal-type contexts only carry a
+    # reference to a separate channel resource, not the level itself) ----
+    channel_refs_needed = set(p["_channel_ref"] for p in publications if p["_channel_ref"] and not p["level"])
+    channel_levels_resolved = resolve_channel_levels(channel_refs_needed)
+    for p in publications:
+        if not p["level"] and p["_channel_ref"]:
+            p["level"] = channel_levels_resolved.get(p["_channel_ref"])
+
+    # Points can only be computed correctly now that level is actually final — this is
+    # why extract_record() no longer computes points itself.
+    for p in publications:
+        base_points, _form = compute_base_nvi_points(p["type"], p["level"], p["_usn_pairs"], p["_total_pairs"])
+        p["points"] = base_points
 
     # ---- Resolve co-publishing partners + finalize the international flag/points ----
     all_partner_roots = set()
@@ -572,6 +669,11 @@ def main():
             p["points"] = round(p["points"] * 1.3, 6)
         else:
             p["points"] = round(p["points"], 6)
+        # Internal-only fields, never meant for the output file — strip them here now
+        # that everything that needed them (points, above) has already run.
+        del p["_channel_ref"]
+        del p["_usn_pairs"]
+        del p["_total_pairs"]
 
     # Sanity checks — surfaced loudly, not silently absorbed. A snapshot that
     # looks structurally fine but has, say, near-zero DOI coverage or a pile
@@ -582,6 +684,7 @@ def main():
     with_points = sum(1 for p in publications if p["points"] > 0)
     with_oa = sum(1 for p in publications if p["open_access"])
     international_count = sum(1 for p in publications if p["international"])
+    with_no_author_id = sum(1 for p in publications if p["units"] and not p["author_ids"])
     by_type = {}
     by_nvi_form = {}
     for p in publications:
@@ -594,6 +697,8 @@ def main():
     print(f"Records with computed points > 0: {with_points}/{len(publications)} ({100*with_points/len(publications):.1f}%)")
     print(f"Inferred open access: {with_oa}/{len(publications)} ({100*with_oa/len(publications):.1f}%)")
     print(f"International (foreign co-affiliation): {international_count}/{len(publications)}")
+    print(f"Distinct USN authors identified: {len(all_person_names)}")
+    print(f"Records with a USN unit but NO resolved author ID (contributor entry with no identity.id): {with_no_author_id}")
     print("Breakdown by NVA category (type):")
     for t, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
         print(f"  {t}: {n}")
@@ -617,6 +722,13 @@ def main():
         for unit in p["units"]:
             by_unit.setdefault(unit, []).append(idx)
 
+    # Same precomputed-index pattern as by_unit — author_id -> [publication indices] —
+    # so the browser tool doesn't have to scan every publication per selected person.
+    by_author = {}
+    for idx, p in enumerate(publications):
+        for author_id in p["author_ids"]:
+            by_author.setdefault(author_id, []).append(idx)
+
     snapshot = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "NVA (api.nva.unit.no/search/resources), institution=222",
@@ -624,8 +736,12 @@ def main():
         "doi_coverage": {"with_doi": with_doi, "total": len(publications)},
         "organizations": org_flat,
         "partner_organizations": partner_orgs_resolved,
+        # {person_id: name} for every USN-affiliated contributor encountered — external
+        # co-authors aren't tracked here (see extract_record's docstring for why).
+        "authors": all_person_names,
         "publications": publications,
         "by_unit": by_unit,
+        "by_author": by_author,
         # Any year(s) where a persistent NVA-side server error blocked pagination even at
         # the smallest fallback size (see fetch_publications_for_year) — empty in the
         # normal case. Present explicitly, not just as a log line, so the gap is visible
