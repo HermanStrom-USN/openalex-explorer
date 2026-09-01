@@ -40,10 +40,18 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- data/nva-snapshot-222.json; then
+          # git add BEFORE checking for a diff, not after — plain `git diff` only detects
+          # changes to files git already tracks, so a genuinely new file (like this one,
+          # the first time this workflow ever produces it under this name) is invisible to
+          # it and silently reported as "no changes", even though it's a real new file
+          # sitting right there. Staging first, then diffing the STAGED state against the
+          # last commit (--cached), correctly detects both a brand-new file and a changed
+          # existing one — confirmed this was the actual cause of a run that built the
+          # file successfully but never committed it (see conversation).
+          git add data/nva-snapshot-222.json
+          if git diff --cached --quiet; then
             echo "No changes to snapshot — nothing to commit."
           else
-            git add data/nva-snapshot-222.json
             git commit -m "Monthly NVA publication snapshot refresh (USN)"
             git push
           fi
