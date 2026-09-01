@@ -128,7 +128,20 @@ API_BASE = "https://api.nva.unit.no"
 USER_AGENT = "USN-bibliometrics-tools/1.0 (contact: herman.strom@usn.no)"
 
 PAGE_SIZE = 100         # requested page size; the script logs what it actually gets back
-MAX_PAGES = 2000        # safety cap: 2000 * 100 = 200,000 records, well above USN's ~58k total
+MAX_PAGES = 20000       # safety cap, checked per year, not per whole run. Originally 2000
+                         # (200,000 records at the default page size — ample headroom for
+                         # USN's ~58k total). Raised after UiB (142,524 total records, ~2.5x
+                         # USN's size) legitimately needed more: when NVA's server returns
+                         # persistent 500s on a chunk of a year's records, this script falls
+                         # back to progressively smaller page sizes (see
+                         # FALLBACK_PAGE_SIZES) to get past them — real progress, confirmed by
+                         # the search_after cursor changing every time, not a stuck loop — but
+                         # each of those smaller pages still only counts as one page toward
+                         # this cap. A rough year with a lot of fallback recovery can burn
+                         # through the old cap on genuine progress alone, especially for a
+                         # larger institution. This is deliberately generous rather than
+                         # precisely tuned, since a true infinite loop (the actual failure mode
+                         # this guards against) would fail fast regardless of the exact number.
 REQUEST_TIMEOUT = 30    # seconds
 RETRY_ATTEMPTS = 4
 RETRY_BACKOFF_SECONDS = 5
