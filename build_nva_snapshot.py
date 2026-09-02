@@ -473,10 +473,25 @@ def extract_channel_ref_and_level(reference):
 def resolve_channel_levels(channel_refs):
     """Resolves scientificValue for each distinct referenced channel resource — one
     fetch per distinct (channel, year) combination, which is far fewer than one per
-    publication, since many articles share the same journal in the same year. A single
-    channel failing to resolve is a cosmetic/coverage gap for publications using it, not
-    a structural problem — logged, not fatal, same reasoning as partner org resolution."""
+    publication, since many articles share the same journal in the same year.
+
+    A failed resolution means every publication using that channel silently scores zero
+    points in this app's own NVI computation, even if the channel genuinely is rated —
+    that's a real, measurable source of under-counting (confirmed against a live
+    discrepancy: USN 2025 computed 793.0 points vs DBH's own authoritative 926.28 — see
+    conversation), not just a cosmetic gap, so this now tracks and reports failures
+    explicitly instead of only logging a warning that's easy to miss in a long run.
+
+    Failed refs get one extra retry pass after finishing the rest of the list, on the
+    theory that NVA's demonstrated 500 pattern throughout this project has generally been
+    transient/position-dependent rather than a permanently broken specific resource — a
+    short pause and a second attempt costs little and may recover a meaningful share of
+    the failures.
+
+    Returns (resolved, failed_refs) — failed_refs is whatever's still unresolved after
+    the retry pass, for the caller to report."""
     resolved = {}
+    failed_refs = []
     refs = sorted(r for r in channel_refs if r)
     print(f"Resolving {len(refs)} distinct channel-year reference(s) for journal-type levels...")
     for i, ref in enumerate(refs, 1):
@@ -485,11 +500,29 @@ def resolve_channel_levels(channel_refs):
             level = data.get("scientificValue")
             resolved[ref] = level if level in ("LevelOne", "LevelTwo") else None
         except Exception as e:
-            print(f"  [warn] Could not resolve channel {ref}: {e} — level will stay unknown for publications using it.", file=sys.stderr)
-            resolved[ref] = None
+            print(f"  [warn] Could not resolve channel {ref}: {e}", file=sys.stderr)
+            failed_refs.append(ref)
         if i % 100 == 0:
             print(f"  ...resolved {i}/{len(refs)}")
-    return resolved
+
+    if failed_refs:
+        print(f"Retrying {len(failed_refs)} failed channel resolution(s) after a short pause...")
+        time.sleep(RETRY_BACKOFF_SECONDS)
+        still_failed = []
+        for ref in failed_refs:
+            try:
+                data = fetch_json(ref)
+                level = data.get("scientificValue")
+                resolved[ref] = level if level in ("LevelOne", "LevelTwo") else None
+            except Exception as e:
+                print(f"  [warn] Still could not resolve channel {ref} on retry: {e}", file=sys.stderr)
+                still_failed.append(ref)
+        recovered = len(failed_refs) - len(still_failed)
+        print(f"Retry recovered {recovered}/{len(failed_refs)} previously-failed channel(s).")
+        failed_refs = still_failed
+
+    print(f"Channel resolution: {len(resolved)} succeeded, {len(failed_refs)} permanently failed (publications using these will show no level and score 0 points).")
+    return resolved, failed_refs
 
 
 _diagnostic_state = {"artifact_printed": False}
@@ -668,7 +701,7 @@ def main():
     # docstring — confirmed via live diagnostic that Journal-type contexts only carry a
     # reference to a separate channel resource, not the level itself) ----
     channel_refs_needed = set(p["_channel_ref"] for p in publications if p["_channel_ref"] and not p["level"])
-    channel_levels_resolved = resolve_channel_levels(channel_refs_needed)
+    channel_levels_resolved, failed_channel_refs = resolve_channel_levels(channel_refs_needed)
     for p in publications:
         if not p["level"] and p["_channel_ref"]:
             p["level"] = channel_levels_resolved.get(p["_channel_ref"])
@@ -775,7 +808,22 @@ def main():
         # to anyone reading the snapshot itself, not only whoever happened to read this
         # run's Action log.
         "pagination_gaps": pagination_gaps,
+        # Distinct channels that never resolved a level despite retries — every
+        # publication referencing one of these silently scores 0 points in this app's own
+        # NVI computation even if the channel genuinely is rated, since points requires a
+        # known level. Confirmed as a real, measurable source of under-counting against a
+        # live discrepancy (see conversation) — present explicitly so a gap this large is
+        # visible in the data itself, not just a warning buried in a long build log.
+        "unresolved_channel_count": len(failed_channel_refs),
     }
+
+    if failed_channel_refs:
+        print(
+            f"WARNING: {len(failed_channel_refs)} channel(s) never resolved a level even after "
+            f"retrying — publications using them will show no level and score 0 points in this "
+            f"app's own NVI computation, understating the true total.",
+            file=sys.stderr,
+        )
 
     if pagination_gaps:
         print(
