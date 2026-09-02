@@ -453,11 +453,27 @@ def extract_channel_ref_and_level(reference):
     checking only the publication record, as an earlier version of this script did,
     silently missed the level for nearly all journal articles.
 
+    Anthology-type contexts (book chapters) are a THIRD, more complex shape — confirmed
+    via a separate live diagnostic against 5 real USN anthology chapters (see
+    conversation): publicationContext is again just {id, type}, but here the id points to
+    an entirely different PUBLICATION record (the parent book/anthology itself), not a
+    channel resource at all. That parent's own publicationContext.publisher is then
+    ANOTHER reference (to publication-channels-v2/publisher/...), not an embedded value —
+    a genuine two-hop chain (chapter -> parent publication -> publisher channel) before
+    scientificValue is ever reachable. A first version of this script treated this
+    channel_ref exactly like the journal case (one fetch, look for scientificValue at the
+    top level) — that "succeeded" on every single chapter (no fetch errors at all) while
+    silently returning nothing useful, since a full publication record has no
+    scientificValue anywhere near its top level. Confirmed against a live discrepancy this
+    caused: every sampled anthology chapter's level came back null, and 4,930 chapter
+    records were completely absent from anything level/points-dependent in the app despite
+    being correctly extracted and indexed everywhere else. Marked with an
+    "ANTHOLOGY_PARENT:" prefix here so resolve_channel_levels() knows to follow the extra
+    hop rather than treating it like a direct channel reference.
+
     For Report/Publisher-type contexts, scientificValue CAN appear directly embedded on
     context.publisher (confirmed against NVA's own documented example) — that's returned
-    directly here as a shortcut, so those records don't need a resolution fetch at all.
-    Both checks run every time since context type isn't itself a reliable signal for
-    which shape applies."""
+    directly here as a shortcut, so those records don't need a resolution fetch at all."""
     context = reference.get("publicationContext") or {}
     direct_level = context.get("scientificValue")
     if not direct_level:
@@ -466,21 +482,73 @@ def extract_channel_ref_and_level(reference):
         direct_level = (context.get("series") or {}).get("scientificValue")
     if direct_level not in ("LevelOne", "LevelTwo"):
         direct_level = None
-    channel_ref = context.get("id")
+
+    context_id = context.get("id")
+    if context.get("type") == "Anthology" and context_id:
+        channel_ref = "ANTHOLOGY_PARENT:" + context_id
+    else:
+        channel_ref = context_id
     return channel_ref, direct_level
+
+
+def resolve_one_channel_level(ref):
+    """Resolves a single channel reference to its level ('LevelOne'/'LevelTwo'/None),
+    following the anthology two-hop chain when the ref carries that prefix (see
+    extract_channel_ref_and_level's docstring). Raises on a genuine fetch failure — the
+    caller (resolve_channel_levels) handles retry/failure tracking; returning None here
+    means a resource was successfully fetched and genuinely has no rating, a real, valid
+    outcome distinct from a failure.
+
+    Publisher is checked before series for the anthology parent's own context — NVI
+    points for book-chapter-form works are rated by the publisher, per DBH's own
+    methodology (see module docstring); series is a secondary bibliographic detail on a
+    book, not what normally carries the rating, but is checked as a fallback since some
+    parent records may only have a series reference and no publisher one. This ordering
+    is a reasonable domain assumption, not verified against an explicit NVI precedence
+    rule — flagged the same way the category mapping already is."""
+    if ref.startswith("ANTHOLOGY_PARENT:"):
+        parent_url = ref[len("ANTHOLOGY_PARENT:"):]
+        parent = fetch_json(parent_url)
+        parent_context = (((parent.get("entityDescription") or {}).get("reference") or {}).get("publicationContext")) or {}
+
+        level = parent_context.get("scientificValue")
+        if level in ("LevelOne", "LevelTwo"):
+            return level
+
+        publisher = parent_context.get("publisher") or {}
+        level = publisher.get("scientificValue")
+        if not level and publisher.get("id"):
+            publisher_data = fetch_json(publisher["id"])
+            level = publisher_data.get("scientificValue")
+        if level in ("LevelOne", "LevelTwo"):
+            return level
+
+        series = parent_context.get("series") or {}
+        level = series.get("scientificValue")
+        if not level and series.get("id"):
+            series_data = fetch_json(series["id"])
+            level = series_data.get("scientificValue")
+        return level if level in ("LevelOne", "LevelTwo") else None
+    else:
+        data = fetch_json(ref)
+        level = data.get("scientificValue")
+        return level if level in ("LevelOne", "LevelTwo") else None
 
 
 def resolve_channel_levels(channel_refs):
     """Resolves scientificValue for each distinct referenced channel resource — one
-    fetch per distinct (channel, year) combination, which is far fewer than one per
-    publication, since many articles share the same journal in the same year.
+    fetch per distinct (channel, year) combination (or, for anthology chapters, one
+    resolution chain per distinct parent publication — see resolve_one_channel_level),
+    far fewer than one per publication overall, since many articles/chapters share the
+    same journal, publisher, or parent book.
 
     A failed resolution means every publication using that channel silently scores zero
     points in this app's own NVI computation, even if the channel genuinely is rated —
-    that's a real, measurable source of under-counting (confirmed against a live
-    discrepancy: USN 2025 computed 793.0 points vs DBH's own authoritative 926.28 — see
-    conversation), not just a cosmetic gap, so this now tracks and reports failures
-    explicitly instead of only logging a warning that's easy to miss in a long run.
+    that's a real, measurable source of under-counting (confirmed against two separate
+    live discrepancies: USN 2025 computed 793.0 points vs DBH's own authoritative 926.28,
+    and separately, every anthology chapter's level resolving to null — see conversation),
+    not just a cosmetic gap, so this tracks and reports failures explicitly instead of
+    only logging a warning that's easy to miss in a long run.
 
     Failed refs get one extra retry pass after finishing the rest of the list, on the
     theory that NVA's demonstrated 500 pattern throughout this project has generally been
@@ -493,12 +561,10 @@ def resolve_channel_levels(channel_refs):
     resolved = {}
     failed_refs = []
     refs = sorted(r for r in channel_refs if r)
-    print(f"Resolving {len(refs)} distinct channel-year reference(s) for journal-type levels...")
+    print(f"Resolving {len(refs)} distinct channel reference(s) for journal- and anthology-type levels...")
     for i, ref in enumerate(refs, 1):
         try:
-            data = fetch_json(ref)
-            level = data.get("scientificValue")
-            resolved[ref] = level if level in ("LevelOne", "LevelTwo") else None
+            resolved[ref] = resolve_one_channel_level(ref)
         except Exception as e:
             print(f"  [warn] Could not resolve channel {ref}: {e}", file=sys.stderr)
             failed_refs.append(ref)
@@ -511,9 +577,7 @@ def resolve_channel_levels(channel_refs):
         still_failed = []
         for ref in failed_refs:
             try:
-                data = fetch_json(ref)
-                level = data.get("scientificValue")
-                resolved[ref] = level if level in ("LevelOne", "LevelTwo") else None
+                resolved[ref] = resolve_one_channel_level(ref)
             except Exception as e:
                 print(f"  [warn] Still could not resolve channel {ref} on retry: {e}", file=sys.stderr)
                 still_failed.append(ref)
