@@ -53,5 +53,17 @@ jobs:
             echo "No changes to snapshot — nothing to commit."
           else
             git commit -m "Monthly NVA publication snapshot refresh (USN)"
-            git push
+            # Retry with a rebase in between — if the multi-institution workflow (or
+            # another run of this one) pushed a commit to a DIFFERENT file at close to the
+            # same moment, our local history is now behind and a plain push would be
+            # rejected outright. Since the two workflows never touch the same file, a
+            # rebase here is conflict-free by construction, not just a best-effort retry.
+            for attempt in 1 2 3 4 5; do
+              if git push; then
+                break
+              fi
+              echo "Push attempt $attempt failed (likely a concurrent commit from another workflow run) — pulling and retrying..."
+              git pull --rebase origin main
+              sleep 5
+            done
           fi
