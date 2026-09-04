@@ -491,7 +491,7 @@ def extract_channel_ref_and_level(reference):
     return channel_ref, direct_level
 
 
-def resolve_one_channel_level(ref):
+def resolve_one_channel_level(ref, channel_names_out=None):
     """Resolves a single channel reference to its level ('LevelOne'/'LevelTwo'/None),
     following the anthology two-hop chain when the ref carries that prefix (see
     extract_channel_ref_and_level's docstring). Raises on a genuine fetch failure — the
@@ -505,7 +505,19 @@ def resolve_one_channel_level(ref):
     book, not what normally carries the rating, but is checked as a fallback since some
     parent records may only have a series reference and no publisher one. This ordering
     is a reasonable domain assumption, not verified against an explicit NVI precedence
-    rule — flagged the same way the category mapping already is."""
+    rule — flagged the same way the category mapping already is.
+
+    channel_names_out is an optional dict this function records a channel's own display
+    name into, wherever one is found along the way — a side channel for building a
+    channel-name search index (see build_channel_lookup_index), added deliberately as an
+    opt-in side effect rather than changing what this function returns: every existing
+    caller of this function only ever wants the level, and this keeps that contract
+    completely unchanged when channel_names_out isn't passed, exactly as it's always
+    behaved through several rounds of hard-won fixes to this exact function."""
+    def _record_name(key, name):
+        if channel_names_out is not None and name:
+            channel_names_out[key] = name
+
     if ref.startswith("ANTHOLOGY_PARENT:"):
         parent_url = ref[len("ANTHOLOGY_PARENT:"):]
         parent = fetch_json(parent_url)
@@ -520,6 +532,7 @@ def resolve_one_channel_level(ref):
         if not level and publisher.get("id"):
             publisher_data = fetch_json(publisher["id"])
             level = publisher_data.get("scientificValue")
+            _record_name(ref, publisher_data.get("name"))
         if level in ("LevelOne", "LevelTwo"):
             return level
 
@@ -528,10 +541,12 @@ def resolve_one_channel_level(ref):
         if not level and series.get("id"):
             series_data = fetch_json(series["id"])
             level = series_data.get("scientificValue")
+            _record_name(ref, series_data.get("name"))
         return level if level in ("LevelOne", "LevelTwo") else None
     else:
         data = fetch_json(ref)
         level = data.get("scientificValue")
+        _record_name(ref, data.get("name"))
         return level if level in ("LevelOne", "LevelTwo") else None
 
 
@@ -556,15 +571,17 @@ def resolve_channel_levels(channel_refs):
     short pause and a second attempt costs little and may recover a meaningful share of
     the failures.
 
-    Returns (resolved, failed_refs) — failed_refs is whatever's still unresolved after
-    the retry pass, for the caller to report."""
+    Returns (resolved, failed_refs, channel_names) — failed_refs is whatever's still
+    unresolved after the retry pass; channel_names is the {ref: display_name} side index
+    described in resolve_one_channel_level, for build_channel_lookup_index to use."""
     resolved = {}
     failed_refs = []
+    channel_names = {}
     refs = sorted(r for r in channel_refs if r)
     print(f"Resolving {len(refs)} distinct channel reference(s) for journal- and anthology-type levels...")
     for i, ref in enumerate(refs, 1):
         try:
-            resolved[ref] = resolve_one_channel_level(ref)
+            resolved[ref] = resolve_one_channel_level(ref, channel_names)
         except Exception as e:
             print(f"  [warn] Could not resolve channel {ref}: {e}", file=sys.stderr)
             failed_refs.append(ref)
@@ -577,7 +594,7 @@ def resolve_channel_levels(channel_refs):
         still_failed = []
         for ref in failed_refs:
             try:
-                resolved[ref] = resolve_one_channel_level(ref)
+                resolved[ref] = resolve_one_channel_level(ref, channel_names)
             except Exception as e:
                 print(f"  [warn] Still could not resolve channel {ref} on retry: {e}", file=sys.stderr)
                 still_failed.append(ref)
@@ -586,7 +603,40 @@ def resolve_channel_levels(channel_refs):
         failed_refs = still_failed
 
     print(f"Channel resolution: {len(resolved)} succeeded, {len(failed_refs)} permanently failed (publications using these will show no level and score 0 points).")
-    return resolved, failed_refs
+    return resolved, failed_refs, channel_names
+
+
+def extract_ref_year(ref):
+    """Pulls the trailing year off a channel reference URL
+    (.../serial-publication/{uuid}/{year}), used only to pick the most recent year's
+    level when the same channel name is seen under multiple years' refs — a channel's
+    rating can genuinely change year to year, so a lookup tool should show the latest
+    known rating, not an arbitrary one. Returns 0 (sorts first, never wins ties) if no
+    trailing year is found, rather than raising — a malformed ref shouldn't crash the
+    whole snapshot build over what's a nice-to-have lookup feature."""
+    match = re.search(r"/(\d{4})$", ref)
+    return int(match.group(1)) if match else 0
+
+
+def build_channel_lookup_index(resolved_levels, channel_names):
+    """Builds a deduplicated {name: {level, year}} index for the client-side channel
+    lookup tool — see conversation. Deliberately only includes channels USN has actually
+    published in (this data comes entirely from resolving THIS institution's own works'
+    channel references), not a general channel registry; a name with no known level
+    resolved (resolved_levels.get(ref) is None) is skipped rather than shown as a
+    misleading blank/unrated entry. When the same channel name appears under multiple
+    years' refs, the most recent year's level wins, since a rating can genuinely change
+    over time and a lookup tool should reflect the latest known one."""
+    index = {}
+    for ref, name in channel_names.items():
+        level = resolved_levels.get(ref)
+        if level not in ("LevelOne", "LevelTwo"):
+            continue
+        year = extract_ref_year(ref)
+        existing = index.get(name)
+        if existing is None or year >= existing["year"]:
+            index[name] = {"level": level, "year": year}
+    return index
 
 
 _diagnostic_state = {"artifact_printed": False}
@@ -765,10 +815,13 @@ def main():
     # docstring — confirmed via live diagnostic that Journal-type contexts only carry a
     # reference to a separate channel resource, not the level itself) ----
     channel_refs_needed = set(p["_channel_ref"] for p in publications if p["_channel_ref"] and not p["level"])
-    channel_levels_resolved, failed_channel_refs = resolve_channel_levels(channel_refs_needed)
+    channel_levels_resolved, failed_channel_refs, channel_names = resolve_channel_levels(channel_refs_needed)
     for p in publications:
         if not p["level"] and p["_channel_ref"]:
             p["level"] = channel_levels_resolved.get(p["_channel_ref"])
+
+    channel_lookup_index = build_channel_lookup_index(channel_levels_resolved, channel_names)
+    print(f"Channel lookup index: {len(channel_lookup_index)} distinct named channel(s) with a known level.")
 
     # Points can only be computed correctly now that level is actually final — this is
     # why extract_record() no longer computes points itself.
@@ -879,6 +932,14 @@ def main():
         # live discrepancy (see conversation) — present explicitly so a gap this large is
         # visible in the data itself, not just a warning buried in a long build log.
         "unresolved_channel_count": len(failed_channel_refs),
+        # {channel_name: {level, year}} — every distinct named channel USN has actually
+        # published in, with its most recently known level. Powers a client-side channel
+        # lookup tool that needs no live API call at all (see conversation) — deliberately
+        # scoped to only what this institution's own works have used, not a general
+        # channel registry; see build_channel_lookup_index's docstring for the full
+        # reasoning, including why a channel with no known level is excluded rather than
+        # shown as a misleading blank entry.
+        "channels": channel_lookup_index,
     }
 
     if failed_channel_refs:
